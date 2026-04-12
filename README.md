@@ -59,10 +59,3 @@ nohup uv run python server.py run --transport sse --port 8000 > server.log 2>&1 
 - `xrefs_to_method(class_name, method_name, session_id)`: Find method invocations.
 - `close_session(session_id)`: Dispose of the decompiler and free memory.
 
-## Development
-
-The server is built using [FastMCP](https://gofastmcp.com). You can use the `dev` command for live reloading and an inspector UI:
-
-```bash
-uv run python server.py dev
-```
