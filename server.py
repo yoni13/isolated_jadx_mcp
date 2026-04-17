@@ -34,20 +34,14 @@ try:
     
     # Import Java classes
     from jadx.api import JadxDecompiler, JadxArgs, ResourceType
-    from java.io import File, PrintStream, OutputStream
+    from java.io import File, PrintStream, ByteArrayOutputStream
     from java.lang import System
     from java.util import List as JavaList
 
-    # Suppress Jadx/Java stdout/stderr noise to keep MCP protocol clean
-    try:
-        from java.io import FileOutputStream
-        null_out = FileOutputStream("/dev/null")
-        null_stream = PrintStream(null_out)
-        System.setOut(null_stream)
-        System.setErr(null_stream)
-    except:
-        # Fallback for systems where /dev/null might not be available as a file
-        pass
+    # Robust OS-agnostic stdout/stderr suppression
+    dummy_stream = PrintStream(ByteArrayOutputStream())
+    System.setOut(dummy_stream)
+    System.setErr(dummy_stream)
 
 except Exception as e:
     logger.error(f"Failed to initialize JVM: {e}")
@@ -56,10 +50,16 @@ except Exception as e:
 mcp = FastMCP("Jadx MCP Server")
 
 # Global session storage
-# Maps session_id -> JadxDecompiler instance
-active_sessions: Dict[str, Any] = {}
+# Maps session_id -> { "decompiler": JadxDecompiler, "class_index": Dict[str, JavaClass] }
+active_sessions: Dict[str, Dict[str, Any]] = {}
 
-def get_decompiler(session_id: str) -> JadxDecompiler:
+def get_session(session_id: str) -> Dict[str, Any]:
+    """
+    Ensure thread is attached to JVM and return the session dictionary.
+    """
+    if not jpype.isThreadAttachedToJVM():
+        jpype.attachThreadToJVM()
+    
     if session_id not in active_sessions:
         raise ValueError(f"Session {session_id} not found. Call load_apk first.")
     return active_sessions[session_id]
@@ -69,6 +69,9 @@ def load_apk(apk_path: str, session_id: str) -> str:
     """
     Load an APK file into a new or existing Jadx session.
     """
+    if not jpype.isThreadAttachedToJVM():
+        jpype.attachThreadToJVM()
+
     try:
         if not os.path.exists(apk_path):
             return f"Error: APK file not found at {apk_path}"
@@ -79,8 +82,6 @@ def load_apk(apk_path: str, session_id: str) -> str:
             
         args = JadxArgs()
         args.setInputFile(File(apk_path))
-        # Headless mode usually doesn't need out dir if we only want code in memory,
-        # but some versions might expect it.
         
         decompiler = JadxDecompiler(args)
         decompiler.load()
@@ -95,12 +96,14 @@ def close_session(session_id: str) -> str:
     """
     Dispose of a Jadx session and free memory.
     """
+    if not jpype.isThreadAttachedToJVM():
+        jpype.attachThreadToJVM()
+
     if session_id in active_sessions:
         try:
-            decompiler = active_sessions.pop(session_id)
-            decompiler.close()
-            # Explicitly suggest GC (though not guaranteed in JPype)
-            # jpype.java.lang.System.gc() 
+            session = active_sessions.pop(session_id)
+            session["decompiler"].close()
+            # session["class_index"].clear()
             return f"Session {session_id} closed."
         except Exception as e:
             return f"Error closing session {session_id}: {str(e)}"
@@ -112,8 +115,8 @@ def get_all_classes(session_id: str) -> List[str]:
     Get a list of all class names in the APK.
     """
     try:
-        decompiler = get_decompiler(session_id)
-        return [str(c.getFullName()) for c in decompiler.getClasses()]
+        session = get_session(session_id)
+        return list(session["class_index"].keys())
     except Exception as e:
         logger.error(f"get_all_classes error: {e}")
         return [f"Error: {str(e)}"]
@@ -124,11 +127,11 @@ def get_class_source(class_name: str, session_id: str) -> str:
     Get the Java source code of a specific class.
     """
     try:
-        decompiler = get_decompiler(session_id)
-        for cls in decompiler.getClasses():
-            if str(cls.getFullName()) == class_name:
-                return str(cls.getCode())
-        return f"Class {class_name} not found."
+        session = get_session(session_id)
+        cls = session["class_index"].get(class_name)
+        if not cls:
+            return f"Class {class_name} not found."
+        return str(cls.getCode())
     except Exception as e:
         return f"Error: {str(e)}"
 
@@ -138,11 +141,11 @@ def get_methods_of_class(class_name: str, session_id: str) -> List[str]:
     List all method signatures of a class.
     """
     try:
-        decompiler = get_decompiler(session_id)
-        for cls in decompiler.getClasses():
-            if str(cls.getFullName()) == class_name:
-                return [str(m.toString()) for m in cls.getMethods()]
-        return [f"Class {class_name} not found."]
+        session = get_session(session_id)
+        cls = session["class_index"].get(class_name)
+        if not cls:
+            return [f"Class {class_name} not found."]
+        return [str(m.toString()) for m in cls.getMethods()]
     except Exception as e:
         return [f"Error: {str(e)}"]
 
@@ -152,34 +155,38 @@ def get_fields_of_class(class_name: str, session_id: str) -> List[str]:
     List all fields of a class.
     """
     try:
-        decompiler = get_decompiler(session_id)
-        for cls in decompiler.getClasses():
-            if str(cls.getFullName()) == class_name:
-                return [str(f.toString()) for f in cls.getFields()]
-        return [f"Class {class_name} not found."]
+        session = get_session(session_id)
+        cls = session["class_index"].get(class_name)
+        if not cls:
+            return [f"Class {class_name} not found."]
+        return [str(f.toString()) for f in cls.getFields()]
     except Exception as e:
         return [f"Error: {str(e)}"]
 
 @mcp.tool()
 def get_method_by_name(class_name: str, method_name: str, session_id: str) -> str:
     """
-    Get the source code of a specific method.
+    Get the source code of a specific method. Handles overloaded methods.
     """
     try:
-        decompiler = get_decompiler(session_id)
-        for cls in decompiler.getClasses():
-            if str(cls.getFullName()) == class_name:
-                # Trigger decompilation to ensure offsets/code are available
-                cls.getCode()
-                for method in cls.getMethods():
-                    if str(method.getName()) == method_name:
-                        code = method.getCodeStr()
-                        if code:
-                            return str(code)
-                        else:
-                            return "Method found but no code snippet available. Try getting class source."
-                return f"Method {method_name} not found in class {class_name}."
-        return f"Class {class_name} not found."
+        session = get_session(session_id)
+        cls = session["class_index"].get(class_name)
+        if not cls:
+            return f"Class {class_name} not found."
+        
+        # Trigger decompilation to ensure offsets/code are available
+        cls.getCode()
+        
+        matching_codes = []
+        for method in cls.getMethods():
+            if str(method.getName()) == method_name:
+                code = method.getCodeStr()
+                if code:
+                    matching_codes.append(f"// Signature: {method.toString()}\n{code}")
+        
+        if matching_codes:
+            return "\n\n".join(matching_codes)
+        return f"Method {method_name} found in class {class_name} but no code snippet available. Try getting class source."
     except Exception as e:
         return f"Error: {str(e)}"
 
@@ -187,14 +194,18 @@ def get_method_by_name(class_name: str, method_name: str, session_id: str) -> st
 def search_classes_by_keyword(keyword: str, session_id: str) -> List[str]:
     """
     Search for classes containing a keyword in their source code.
+    WARNING: This tool is expensive as it may trigger decompilation. Use specific keywords.
     """
     try:
-        decompiler = get_decompiler(session_id)
+        session = get_session(session_id)
+        decompiler = session["decompiler"]
         matching_classes = []
-        for cls in decompiler.getClasses():
+        # Fallback to linear search if getTextSearchIndex is not easily usable via JPype
+        # but optimized to use the index
+        for name, cls in session["class_index"].items():
             code = str(cls.getCode())
             if keyword in code:
-                matching_classes.append(str(cls.getFullName()))
+                matching_classes.append(name)
         return matching_classes
     except Exception as e:
         return [f"Error: {str(e)}"]
@@ -205,11 +216,11 @@ def xrefs_to_class(class_name: str, session_id: str) -> List[str]:
     Find where a class is used.
     """
     try:
-        decompiler = get_decompiler(session_id)
-        for cls in decompiler.getClasses():
-            if str(cls.getFullName()) == class_name:
-                return [str(node.toString()) for node in cls.getUseIn()]
-        return [f"Class {class_name} not found."]
+        session = get_session(session_id)
+        cls = session["class_index"].get(class_name)
+        if not cls:
+            return [f"Class {class_name} not found."]
+        return [str(node.toString()) for node in cls.getUseIn()]
     except Exception as e:
         return [f"Error: {str(e)}"]
 
@@ -219,14 +230,18 @@ def xrefs_to_method(class_name: str, method_name: str, session_id: str) -> List[
     Find where a method is invoked.
     """
     try:
-        decompiler = get_decompiler(session_id)
-        for cls in decompiler.getClasses():
-            if str(cls.getFullName()) == class_name:
-                for method in cls.getMethods():
-                    if str(method.getName()) == method_name:
-                        return [str(node.toString()) for node in method.getUseIn()]
-                return [f"Method {method_name} not found in class {class_name}."]
-        return [f"Class {class_name} not found."]
+        session = get_session(session_id)
+        cls = session["class_index"].get(class_name)
+        if not cls:
+            return [f"Class {class_name} not found."]
+        
+        for method in cls.getMethods():
+            if str(method.getName()) == method_name:
+                # Note: this returns usage for ALL overloaded methods with this name
+                # To be precise, we'd need signature matching
+                return [str(node.toString()) for node in method.getUseIn()]
+        
+        return [f"Method {method_name} not found in class {class_name}."]
     except Exception as e:
         return [f"Error: {str(e)}"]
 
@@ -236,7 +251,8 @@ def get_android_manifest(session_id: str) -> str:
     Retrieve the AndroidManifest.xml.
     """
     try:
-        decompiler = get_decompiler(session_id)
+        session = get_session(session_id)
+        decompiler = session["decompiler"]
         for res in decompiler.getResources():
             if str(res.getOriginalName()) == "AndroidManifest.xml":
                 content = res.loadContent()
@@ -249,16 +265,26 @@ def get_android_manifest(session_id: str) -> str:
 @mcp.tool()
 def get_strings(session_id: str) -> str:
     """
-    Retrieve strings.xml content.
+    Retrieve default strings.xml content (res/values/strings.xml).
     """
     try:
-        decompiler = get_decompiler(session_id)
+        session = get_session(session_id)
+        decompiler = session["decompiler"]
         for res in decompiler.getResources():
             name = str(res.getOriginalName())
-            if name.endswith("strings.xml"):
+            # Target the default strings file to avoid getting localized versions first
+            if name == "res/values/strings.xml" or name.endswith("/res/values/strings.xml"):
                 content = res.loadContent()
                 if content and content.getText():
                     return str(content.getText().getCodeStr())
+        
+        # Fallback to any strings.xml if default not found
+        for res in decompiler.getResources():
+            if str(res.getOriginalName()).endswith("strings.xml"):
+                content = res.loadContent()
+                if content and content.getText():
+                    return str(content.getText().getCodeStr())
+                    
         return "strings.xml not found."
     except Exception as e:
         return f"Error: {str(e)}"
@@ -269,7 +295,8 @@ def get_all_resource_file_names(session_id: str) -> List[str]:
     List all resource files in the APK.
     """
     try:
-        decompiler = get_decompiler(session_id)
+        session = get_session(session_id)
+        decompiler = session["decompiler"]
         return [str(res.getOriginalName()) for res in decompiler.getResources()]
     except Exception as e:
         return [f"Error: {str(e)}"]
