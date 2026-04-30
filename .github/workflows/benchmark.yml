@@ -1,0 +1,129 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Benchmark every MCP tool function in server.py
+#
+# APK under test : NewPipe v0.28.5
+#                  https://archive.newpipe.net/fdroid/repo/NewPipe_v0.28.5.apk
+#
+# The workflow:
+#   1. Installs Java 17 (needed by JPype/JVM)
+#   2. Downloads jadx 1.5.1 and extracts jadx-dev-all.jar
+#   3. Downloads the NewPipe APK (both cached across runs)
+#   4. Installs Python deps with uv
+#   5. Runs benchmarks/bench.py, which calls every @mcp.tool() directly
+#   6. Uploads benchmark_results.json as an artifact
+#   7. Posts a Markdown table to the GitHub Actions job summary
+#
+# Triggers : every push / PR, plus manual dispatch.
+# Timeout  : 120 min  (search_classes_by_keyword can be slow on large APKs)
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: MCP Function Benchmarks
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      bench_runs:
+        description: "Timed iterations per fast function (default: 3)"
+        required: false
+        default: "3"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: Benchmark (NewPipe v0.28.5)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      JADX_VERSION: "1.5.1"
+      APK_URL: "https://archive.newpipe.net/fdroid/repo/NewPipe_v0.28.5.apk"
+      APK_CACHE_KEY: "newpipe-v0.28.5"
+      BENCH_RUNS: ${{ github.event.inputs.bench_runs || '3' }}
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Java ────────────────────────────────────────────────────────────────
+      - name: Set up Java 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # ── jadx ────────────────────────────────────────────────────────────────
+      - name: Cache jadx ${{ env.JADX_VERSION }}
+        id: cache-jadx
+        uses: actions/cache@v4
+        with:
+          path: /tmp/jadx
+          key: jadx-${{ env.JADX_VERSION }}
+
+      - name: Download & extract jadx ${{ env.JADX_VERSION }}
+        if: steps.cache-jadx.outputs.cache-hit != 'true'
+        run: |
+          wget -q \
+            "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip" \
+            -O /tmp/jadx.zip
+          mkdir -p /tmp/jadx
+          unzip -q /tmp/jadx.zip -d /tmp/jadx
+
+      - name: Locate jadx-dev-all.jar and export JADX_JAR
+        run: |
+          JAR=$(find /tmp/jadx -name 'jadx-dev-all.jar' | head -1)
+          if [ -z "$JAR" ]; then
+            echo "::error::jadx-dev-all.jar not found after extraction"
+            find /tmp/jadx -type f | sort
+            exit 1
+          fi
+          echo "JADX_JAR=${JAR}" >> "$GITHUB_ENV"
+          echo "Found: ${JAR}"
+
+      # ── NewPipe APK ─────────────────────────────────────────────────────────
+      - name: Cache NewPipe APK
+        id: cache-apk
+        uses: actions/cache@v4
+        with:
+          path: /tmp/newpipe.apk
+          key: ${{ env.APK_CACHE_KEY }}
+
+      - name: Download NewPipe v0.28.5 APK
+        if: steps.cache-apk.outputs.cache-hit != 'true'
+        run: |
+          wget --progress=dot:mega \
+            "${{ env.APK_URL }}" \
+            -O /tmp/newpipe.apk
+          echo "APK size: $(du -sh /tmp/newpipe.apk | cut -f1)"
+
+      - name: Export APK_PATH
+        run: echo "APK_PATH=/tmp/newpipe.apk" >> "$GITHUB_ENV"
+
+      # ── Python / uv ─────────────────────────────────────────────────────────
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install Python dependencies
+        run: uv sync --frozen
+
+      # ── Benchmark ───────────────────────────────────────────────────────────
+      - name: Run benchmarks
+        run: uv run python benchmarks/bench.py
+
+      # ── Artifacts ───────────────────────────────────────────────────────────
+      - name: Upload benchmark results (JSON)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.run_number }}
+          path: benchmark_results.json
+          retention-days: 90
+          if-no-files-found: warn
