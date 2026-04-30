@@ -41,6 +41,7 @@ import json
 import os
 import sys
 import time
+import tracemalloc
 from pathlib import Path
 from typing import Any, Callable
 
@@ -95,6 +96,22 @@ print(f"✅  Server ready  ({_jvm_ms:,.0f} ms)\n", flush=True)
 RESULTS: list[dict[str, Any]] = []
 
 
+def _rss_mb() -> float:
+    """
+    Current process RSS in MiB, read from /proc/self/status (Linux).
+    Captures both Python heap and JVM heap in one number.
+    Returns 0.0 on non-Linux platforms.
+    """
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024  # kB → MiB
+    except Exception:  # noqa: BLE001
+        pass
+    return 0.0
+
+
 def run_bench(
     name: str,
     fn: Callable[..., Any],
@@ -107,6 +124,10 @@ def run_bench(
     Warm-up *warmup* times (untimed), then time *runs* executions.
     Appends a record to RESULTS and prints one summary line.
 
+    Per-run memory is tracked two ways:
+      • RSS delta  – change in process RSS (Python + JVM heap) via /proc/self/status
+      • Python heap peak – peak Python-only allocation via tracemalloc
+
     ``runs`` and ``warmup`` are consumed by this function; every other
     keyword argument is forwarded to *fn*.
     """
@@ -116,14 +137,32 @@ def run_bench(
         last = fn(*args, **kwargs)
 
     times: list[float] = []
+    rss_deltas: list[float] = []   # MiB delta per run (process RSS)
+    py_peaks: list[float] = []     # MiB peak Python allocation per run
+
     for _ in range(runs):
+        rss_before = _rss_mb()
+
+        tracemalloc.start()
         t0 = time.perf_counter()
         last = fn(*args, **kwargs)
-        times.append(time.perf_counter() - t0)
+        elapsed = time.perf_counter() - t0
+        _cur, py_peak_bytes = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
 
-    avg_ms = sum(times) / len(times) * 1000
-    min_ms = min(times) * 1000
-    max_ms = max(times) * 1000
+        rss_after = _rss_mb()
+
+        times.append(elapsed)
+        rss_deltas.append(rss_after - rss_before)
+        py_peaks.append(py_peak_bytes / 1024 / 1024)
+
+    avg_ms   = sum(times) / len(times) * 1000
+    min_ms   = min(times) * 1000
+    max_ms   = max(times) * 1000
+    avg_rss  = sum(rss_deltas) / len(rss_deltas)  # mean RSS delta (MiB)
+    max_rss  = max(rss_deltas)                     # worst-case RSS delta
+    avg_py   = sum(py_peaks)   / len(py_peaks)     # mean Python-heap peak
+    max_py   = max(py_peaks)                       # worst-case Python-heap peak
 
     ok: bool | None = last.get("ok") if isinstance(last, dict) else None
     icon = "✅" if ok is True else ("⚠️ " if ok is None else "❌")
@@ -132,9 +171,13 @@ def run_bench(
         {
             "function": name,
             "runs": runs,
-            "avg_ms": round(avg_ms, 2),
-            "min_ms": round(min_ms, 2),
-            "max_ms": round(max_ms, 2),
+            "avg_ms":       round(avg_ms,  2),
+            "min_ms":       round(min_ms,  2),
+            "max_ms":       round(max_ms,  2),
+            "avg_rss_delta_mb": round(avg_rss, 2),
+            "max_rss_delta_mb": round(max_rss, 2),
+            "avg_py_peak_mb":   round(avg_py,  2),
+            "max_py_peak_mb":   round(max_py,  2),
             "ok": ok,
         }
     )
@@ -142,7 +185,9 @@ def run_bench(
         f"{icon}  {name:<45}  "
         f"avg={avg_ms:9.1f} ms  "
         f"min={min_ms:9.1f} ms  "
-        f"max={max_ms:9.1f} ms",
+        f"max={max_ms:9.1f} ms  "
+        f"rss_delta={avg_rss:+7.1f} MiB  "
+        f"py_peak={avg_py:6.1f} MiB",
         flush=True,
     )
     return last
@@ -300,12 +345,14 @@ print(f"📁  JSON results  → {RESULTS_PATH}")
 
 # Console summary table ──────────────────────────────────────────────────────
 col = [
-    ("Function",  "function", ":<47"),
-    ("Runs",      "runs",     ":>4"),
-    ("Avg (ms)",  "avg_ms",   ":>10"),
-    ("Min (ms)",  "min_ms",   ":>10"),
-    ("Max (ms)",  "max_ms",   ":>10"),
-    ("ok",        "ok",       ":>5"),
+    ("Function",           "function",          ":<47"),
+    ("Runs",               "runs",               ":>4"),
+    ("Avg (ms)",           "avg_ms",             ":>10"),
+    ("Min (ms)",           "min_ms",             ":>10"),
+    ("Max (ms)",           "max_ms",             ":>10"),
+    ("RSS delta (MiB)",    "avg_rss_delta_mb",   ":>16"),
+    ("Py peak (MiB)",      "avg_py_peak_mb",     ":>14"),
+    ("ok",                 "ok",                 ":>5"),
 ]
 print()
 hdr  = "  ".join(f"{h:{fmt[1:]}}" for h, _, fmt in col)
@@ -326,14 +373,16 @@ if GITHUB_STEP_SUMMARY:
         fh.write(f"> **APK:** `{APK_PATH}`  \n")
         fh.write(f"> **JVM startup:** {_jvm_ms:,.0f} ms\n\n")
         fh.write(
-            "| Function | Runs | Avg (ms) | Min (ms) | Max (ms) | Status |\n"
-            "|:---|---:|---:|---:|---:|:---:|\n"
+            "| Function | Runs | Avg (ms) | Min (ms) | Max (ms) "
+            "| RSS delta (MiB) | Py peak (MiB) | Status |\n"
+            "|:---|---:|---:|---:|---:|---:|---:|:---:|\n"
         )
         for r in RESULTS:
             status = "✅" if r["ok"] is True else ("—" if r["ok"] is None else "❌")
             fh.write(
                 f"| `{r['function']}` | {r['runs']} "
                 f"| {r['avg_ms']:.1f} | {r['min_ms']:.1f} | {r['max_ms']:.1f} "
+                f"| {r['avg_rss_delta_mb']:+.1f} | {r['avg_py_peak_mb']:.1f} "
                 f"| {status} |\n"
             )
     print(f"📋  Step summary   → {GITHUB_STEP_SUMMARY}")
