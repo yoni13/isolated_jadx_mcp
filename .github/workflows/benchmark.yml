@@ -41,7 +41,7 @@ jobs:
     timeout-minutes: 120
 
     env:
-      JADX_VERSION: "1.5.1"
+      JADX_VERSION: "1.5.5"
       APK_URL: "https://archive.newpipe.net/fdroid/repo/NewPipe_v0.28.5.apk"
       APK_CACHE_KEY: "newpipe-v0.28.5"
       BENCH_RUNS: ${{ github.event.inputs.bench_runs || '3' }}
@@ -73,13 +73,15 @@ jobs:
             "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip" \
             -O /tmp/jadx.zip
           mkdir -p /tmp/jadx
+          # The zip extracts bin/ lib/ etc. directly (no top-level subdir)
           unzip -q /tmp/jadx.zip -d /tmp/jadx
 
-      - name: Locate jadx-dev-all.jar and export JADX_JAR
+      - name: Locate jadx all-in-one jar and export JADX_JAR
         run: |
-          JAR=$(find /tmp/jadx -name 'jadx-dev-all.jar' | head -1)
+          # Release jars are named jadx-X.Y.Z-all.jar (not jadx-dev-all.jar)
+          JAR=$(find /tmp/jadx/lib -name 'jadx-*-all.jar' | head -1)
           if [ -z "$JAR" ]; then
-            echo "::error::jadx-dev-all.jar not found after extraction"
+            echo "::error::jadx-*-all.jar not found after extraction"
             find /tmp/jadx -type f | sort
             exit 1
           fi
