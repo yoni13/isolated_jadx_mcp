@@ -1,4 +1,5 @@
 # Jadx MCP Server
+[![MCP Function Benchmarks](https://github.com/yoni13/isolated_jadx_mcp/actions/workflows/benchmark.yml/badge.svg)](https://github.com/yoni13/isolated_jadx_mcp/actions/workflows/benchmark.yml)
 
 A comprehensive Model Context Protocol (MCP) server that acts as a wrapper around the Jadx Android decompiler. It uses `JPype1` to load the `jadx-core` logic directly into the Python process, allowing for completely in-memory and headless APK analysis.
 
@@ -58,4 +59,3 @@ nohup uv run python server.py run --transport sse --port 8000 > server.log 2>&1 
 - `xrefs_to_class(class_name, session_id)`: Find where a class is used.
 - `xrefs_to_method(class_name, method_name, session_id)`: Find method invocations.
 - `close_session(session_id)`: Dispose of the decompiler and free memory.
-
