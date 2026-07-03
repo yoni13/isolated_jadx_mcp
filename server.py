@@ -21,12 +21,15 @@ helpers below encapsulate that.
 
 from __future__ import annotations
 
+import atexit
 import base64
 import logging
 import os
+import signal
 import sys
 import threading
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -80,6 +83,20 @@ from java.lang import System                                   # type: ignore # 
 _devnull = PrintStream(ByteArrayOutputStream())
 System.setOut(_devnull)
 System.setErr(_devnull)
+
+
+def _free_memory() -> int:
+    """Return JVM free heap in bytes."""
+    runtime = System.getRuntime()
+    return int(runtime.freeMemory())
+
+
+def _gc() -> None:
+    """Hint the JVM to run garbage collection."""
+    try:
+        System.gc()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +405,35 @@ _sessions: Dict[str, Session] = {}
 _sessions_lock = threading.Lock()
 
 
+def _shutdown_all() -> None:
+    """Close all open sessions and tear down the JVM."""
+    with _sessions_lock:
+        sessions = list(_sessions.values())
+        _sessions.clear()
+    for sess in sessions:
+        try:
+            sess.close()
+        except Exception:  # noqa: BLE001
+            pass
+    if jpype.isJVMStarted():
+        try:
+            jpype.shutdownJVM()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+atexit.register(_shutdown_all)
+
+
+def _signal_handler(signum: int, frame: Any) -> None:
+    _shutdown_all()
+    os._exit(0)
+
+
+signal.signal(signal.SIGTERM, _signal_handler)
+signal.signal(signal.SIGINT, _signal_handler)
+
+
 def _require(session_id: str) -> Session:
     with _sessions_lock:
         sess = _sessions.get(session_id)
@@ -420,7 +466,7 @@ def load_apk(apk_path: str, session_id: str) -> Dict[str, Any]:
         args = JadxArgs()
         args.setInputFile(File(apk_path))
         args.setShowInconsistentCode(True)
-        args.setThreadsCount(max(1, os.cpu_count() or 2))
+        args.setThreadsCount(int(os.environ.get("JADX_THREADS", str(max(1, os.cpu_count() or 2)))))
 
         decompiler = JadxDecompiler(args)
         try:
@@ -648,21 +694,73 @@ def search_classes_by_keyword(
     Search decompiled source for a keyword. Forces decompilation of any class
     not yet decompiled — prefer narrow keywords. jadx caches each class's
     decompiled code on the node, so repeat searches don't redo work.
+
+    Classes are decompiled in parallel using a ThreadPoolExecutor sized to
+    ``JADX_SEARCH_THREADS`` (default 4).  JPype releases the GIL during JNI
+    calls so true parallelism is achieved across the JVM's own thread pool.
+
+    Heap pressure is monitored between batches: if free heap drops below a
+    threshold a ``System.gc()`` is requested, and if it stays critically low
+    the search aborts early to avoid a GC death spiral.
     """
     try:
         s = _require(session_id)
         needle = keyword if case_sensitive else keyword.lower()
         jlist = s.decompiler.getClasses()
         n = int(jlist.size())
+        search_workers = int(
+            os.environ.get("JADX_SEARCH_THREADS", "4")
+        )
+        max_heap = int(System.getRuntime().maxMemory())
+        gc_threshold = int(max_heap * 0.25)
+        abort_threshold = int(max_heap * 0.08)
         matches: List[str] = []
-        for i in range(n):
+        stop = threading.Event()
+
+        def _decompile_and_check(i: int) -> Optional[str]:
+            if stop.is_set():
+                return None
             cls = jlist.get(i)
             code = _s(cls.getCode())
+            if stop.is_set():
+                return None
             hay = code if case_sensitive else code.lower()
             if needle in hay:
-                matches.append(str(cls.getFullName()))
-                if len(matches) >= limit:
+                return str(cls.getFullName())
+            return None
+
+        batch_size = search_workers * 4
+        with ThreadPoolExecutor(max_workers=search_workers) as pool:
+            for start in range(0, n, batch_size):
+                if stop.is_set():
                     break
+
+                free = _free_memory()
+                if free < gc_threshold:
+                    _gc()
+                    free = _free_memory()
+                    if free < abort_threshold:
+                        log.warning(
+                            "JVM heap critically low (%d / %d free); "
+                            "aborting search at class %d/%d",
+                            free, max_heap, start, n,
+                        )
+                        break
+
+                end = min(start + batch_size, n)
+                futures = [
+                    pool.submit(_decompile_and_check, i) for i in range(start, end)
+                ]
+                for fut in as_completed(futures):
+                    if stop.is_set():
+                        break
+                    name = fut.result()
+                    if name is not None:
+                        matches.append(name)
+                        if len(matches) >= limit:
+                            stop.set()
+                            break
+
         return _ok(
             keyword=keyword,
             matches=matches,
