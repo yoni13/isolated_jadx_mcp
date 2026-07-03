@@ -42,7 +42,7 @@ jobs:
 
     env:
       JADX_VERSION: "1.5.5"
-      APK_URL: "https://archive.newpipe.net/fdroid/repo/NewPipe_v0.28.5.apk"
+      APK_URL: "https://github.com/TeamNewPipe/NewPipe/releases/download/v0.28.5/NewPipe_v0.28.5.apk"
       APK_CACHE_KEY: "newpipe-v0.28.5"
       BENCH_RUNS: ${{ github.event.inputs.bench_runs || '3' }}
 
