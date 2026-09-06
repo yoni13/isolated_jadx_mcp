@@ -387,5 +387,12 @@ if GITHUB_STEP_SUMMARY:
             )
     print(f"📋  Step summary   → {GITHUB_STEP_SUMMARY}")
 
+# Fail the run if any function reported ok=False ────────────────────────────
+failed = [r["function"] for r in RESULTS if r["ok"] is False]
+if failed:
+    print()
+    print(f"❌  {len(failed)} function(s) reported ok=False: {', '.join(failed)}", file=sys.stderr)
+    sys.exit(1)
+
 print()
 print("✅  Benchmark complete.")
